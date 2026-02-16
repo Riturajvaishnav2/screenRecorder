@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Screen Share + Screen Recorder (Mic + System Audio)</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+    video { width: 720px; max-width: 100%; background: #111; border-radius: 12px; }
+    button, label { padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .card { border: 1px solid #e6e6e6; border-radius: 14px; padding: 12px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; align-items: center; }
+    .small { font-size: 12px; color: #555; }
+    .log { white-space: pre-wrap; background: #f7f7f7; border-radius: 12px; padding: 10px; border: 1px solid #eee; }
+  </style>
+</head>
+<body>
+  <h2>Screen Share + Screen Recorder</h2>
+  <p class="small">
+    Records screen + mic audio (and system/tab audio if available). Best on Chrome/Edge (desktop). Use HTTPS or localhost.
+  </p>
+
+  <div class="row">
+    <div class="card">
+      <h3>Live Preview (what will be recorded)</h3>
+      <video id="preview" autoplay playsinline muted></video>
+
+      <div class="controls">
+        <label class="small">
+          <input type="checkbox" id="enableMic" checked />
+          Capture microphone audio
+        </label>
+
+        <label class="small">
+          <input type="checkbox" id="enableSystemAudio" checked />
+          Try to capture system/tab audio (if browser allows)
+        </label>
+      </div>
+
+      <div class="controls">
+        <button id="startShare">Start Screen Share</button>
+        <button id="stopShare" disabled>Stop Share</button>
+      </div>
+
+      <div class="controls">
+        <button id="startRec" disabled>Start Recording</button>
+        <button id="stopRec" disabled>Stop Recording</button>
+      </div>
+
+      <div class="controls">
+        <button id="chooseFolder">Choose Save Folder (optional)</button>
+        <button id="forgetFolder">Forget Folder</button>
+      </div>
+
+      <p class="small">
+        Tip: To get system audio reliably, select a <b>Chrome Tab</b> and enable <b>Share audio</b> in the picker (if shown).
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>Playback</h3>
+      <video id="playback" controls playsinline></video>
+      <div class="controls">
+        <button id="download" disabled>Download Recording</button>
+      </div>
+      <p class="small">Recorded format is usually WebM.</p>
+    </div>
+  </div>
+
+  <h3>Status</h3>
+  <div id="log" class="log"></div>
+
+<script>
+(() => {
+  const preview = document.getElementById('preview');
+  const playback = document.getElementById('playback');
+
+  const enableMic = document.getElementById('enableMic');
+  const enableSystemAudio = document.getElementById('enableSystemAudio');
+
+  const startShareBtn = document.getElementById('startShare');
+  const stopShareBtn = document.getElementById('stopShare');
+  const startRecBtn = document.getElementById('startRec');
+  const stopRecBtn = document.getElementById('stopRec');
+  const downloadBtn = document.getElementById('download');
+
+  const chooseFolderBtn = document.getElementById('chooseFolder');
+  const forgetFolderBtn = document.getElementById('forgetFolder');
+
+  const logEl = document.getElementById('log');
+  const log = (m) => { logEl.textContent += m + "\n"; };
+
+  let screenStream = null;
+  let micStream = null;
+  let mixedStream = null;
+
+  let recorder = null;
+  let chunks = [];
+  let recordedBlob = null;
+
+  let folderHandle = null;
+
+  function setUI({ sharing, recording }) {
+    startShareBtn.disabled = sharing;
+    stopShareBtn.disabled = !sharing;
+
+    startRecBtn.disabled = !sharing || recording;
+    stopRecBtn.disabled = !recording;
+
+    downloadBtn.disabled = !recordedBlob;
+  }
+
+  function pickMimeType() {
+    const candidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ];
+    for (const t of candidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+    }
+    return '';
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function saveToChosenFolder(blob, filename) {
+    if (!folderHandle) return false;
+    try {
+      const fileHandle = await folderHandle.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return true;
+    } catch (e) {
+      log("Folder save failed: " + e.message);
+      return false;
+    }
+  }
+
+  function stopAllStreams() {
+    for (const s of [screenStream, micStream, mixedStream]) {
+      if (s) s.getTracks().forEach(t => t.stop());
+    }
+    screenStream = micStream = mixedStream = null;
+  }
+
+  function buildMixedStream(display, mic) {
+    // Result: display video track + mixed audio track (system/tab + mic)
+    const out = new MediaStream();
+
+    // Add display video
+    display.getVideoTracks().forEach(t => out.addTrack(t));
+
+    // Mix audio using WebAudio
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioContextClass();
+    const destination = ctx.createMediaStreamDestination();
+
+    let connectedAnyAudio = false;
+
+    // Display/system audio (if present)
+    const displayAudioTracks = display.getAudioTracks();
+    if (displayAudioTracks.length) {
+      const displayAudioStream = new MediaStream(displayAudioTracks);
+      const source = ctx.createMediaStreamSource(displayAudioStream);
+      source.connect(destination);
+      connectedAnyAudio = true;
+      log("System/tab audio track detected and mixed.");
+    } else {
+      log("No system/tab audio track from screen share.");
+    }
+
+    // Mic audio (if present)
+    if (mic) {
+      const micTracks = mic.getAudioTracks();
+      if (micTracks.length) {
+        const micOnly = new MediaStream(micTracks);
+        const micSource = ctx.createMediaStreamSource(micOnly);
+        micSource.connect(destination);
+        connectedAnyAudio = true;
+        log("Microphone audio mixed.");
+      }
+    } else {
+      log("Microphone capture disabled.");
+    }
+
+    // Add mixed audio track if any
+    if (connectedAnyAudio) {
+      destination.stream.getAudioTracks().forEach(t => out.addTrack(t));
+    } else {
+      log("No audio sources available to mix (recording will be silent).");
+    }
+
+    return out;
+  }
+
+  async function startShare() {
+    try {
+      // Reset previous
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+      stopAllStreams();
+      preview.srcObject = null;
+
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        alert("getDisplayMedia not supported in this browser.");
+        return;
+      }
+
+      // Ask for screen share
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: enableSystemAudio.checked
+      });
+
+      // Ask for microphone (optional)
+      if (enableMic.checked) {
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        } catch (e) {
+          micStream = null;
+          log("Mic permission denied/unavailable: " + e.message);
+        }
+      }
+
+      // Mix and preview
+      mixedStream = buildMixedStream(screenStream, micStream);
+      preview.srcObject = mixedStream;
+
+      // Handle “Stop sharing” from browser UI
+      const [videoTrack] = screenStream.getVideoTracks();
+      if (videoTrack) {
+        videoTrack.onended = () => {
+          log("Screen share ended by user.");
+          stopShare();
+        };
+      }
+
+      log("Screen share started.");
+      setUI({ sharing: true, recording: false });
+    } catch (e) {
+      log("Start share error: " + e.message);
+      alert("Could not start screen share: " + e.message);
+    }
+  }
+
+  function stopShare() {
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+    stopAllStreams();
+    preview.srcObject = null;
+    log("Share stopped.");
+    setUI({ sharing: false, recording: false });
+  }
+
+  function startRecording() {
+    if (!mixedStream) return;
+    if (!window.MediaRecorder) {
+      alert("MediaRecorder not supported in this browser.");
+      return;
+    }
+
+    chunks = [];
+    recordedBlob = null;
+    playback.removeAttribute("src");
+    playback.load();
+
+    const mimeType = pickMimeType();
+    recorder = new MediaRecorder(mixedStream, mimeType ? { mimeType } : undefined);
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+
+    recorder.onstop = () => {
+      recordedBlob = new Blob(chunks, { type: recorder.mimeType || "video/webm" });
+      playback.src = URL.createObjectURL(recordedBlob);
+      log(`Recording ready. Size: ${Math.round(recordedBlob.size/1024)} KB, type: ${recordedBlob.type}`);
+      setUI({ sharing: !!mixedStream, recording: false });
+    };
+
+    recorder.start();
+    log("Recording started.");
+    setUI({ sharing: true, recording: true });
+  }
+
+  function stopRecording() {
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+      log("Stopping recorder...");
+    }
+  }
+
+  async function downloadRecording() {
+    if (!recordedBlob) return;
+    const filename = `screen_recording_${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
+
+    const saved = await saveToChosenFolder(recordedBlob, filename);
+    if (saved) {
+      log("Saved to chosen folder: " + filename);
+    } else {
+      downloadBlob(recordedBlob, filename);
+      log("Downloaded: " + filename);
+    }
+    setUI({ sharing: !!mixedStream, recording: recorder?.state === "recording" });
+  }
+
+  async function chooseFolder() {
+    if (!window.showDirectoryPicker) {
+      alert("Choose Folder works in Chrome/Edge. Downloads still work in other browsers.");
+      return;
+    }
+    try {
+      folderHandle = await window.showDirectoryPicker();
+      log("Folder chosen for direct saves.");
+    } catch (e) {
+      log("Folder picker cancelled/failed: " + e.message);
+    }
+  }
+
+  function forgetFolder() {
+    folderHandle = null;
+    log("Forgot chosen folder.");
+  }
+
+  // Wire up
+  startShareBtn.addEventListener('click', startShare);
+  stopShareBtn.addEventListener('click', stopShare);
+
+  startRecBtn.addEventListener('click', startRecording);
+  stopRecBtn.addEventListener('click', stopRecording);
+
+  downloadBtn.addEventListener('click', downloadRecording);
+
+  chooseFolderBtn.addEventListener('click', chooseFolder);
+  forgetFolderBtn.addEventListener('click', forgetFolder);
+
+  // Init
+  log("Ready.");
+  setUI({ sharing: false, recording: false });
+})();
+</script>
+</body>
+</html>
